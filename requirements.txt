@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+scikit-learn
+plotly
+joblib
+openpyxl
+xgboost
+holidays
+# optional, only for the 'polish with Claude' button:
+# anthropic
