@@ -12,6 +12,7 @@ import streamlit as st
 
 import forecaster as fc
 import inventory as inv
+import news
 
 # ---------------------------------------------------------------- THEME FILE
 THEME_TOML = """[theme]
@@ -121,6 +122,13 @@ section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0D0919,#000)
 .prow .pa{font-weight:700;color:#fff;}.prow .pm{color:var(--muted);font-size:.9rem;}
 .chip{padding:.15rem .7rem;border-radius:999px;font-size:.8rem;font-weight:700;}
 .chip.hi{background:rgba(251,113,133,.16);color:#FDA4AF;}.chip.md{background:rgba(251,191,36,.16);color:#FCD34D;}.chip.lo{background:rgba(52,211,153,.16);color:#6EE7B7;}
+.chip.nu{background:rgba(255,255,255,.08);color:var(--muted);}
+.nrow{padding:.75rem 1rem;margin-bottom:.4rem;background:rgba(255,255,255,.04);border-radius:8px;border-left:4px solid var(--muted);}
+.nrow.hi{border-left-color:#FB7185;}.nrow.md{border-left-color:#FBBF24;}.nrow.lo{border-left-color:#34D399;}
+.nrow a{color:#fff;font-weight:600;text-decoration:none;line-height:1.4;}
+.nrow a:hover{color:var(--lilac);text-decoration:underline;}
+.nrow .nm{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-top:.35rem;color:var(--muted);font-size:.84rem;}
+.tag{border:1px solid var(--line);color:var(--lilac);padding:.05rem .6rem;border-radius:999px;font-size:.76rem;}
 [class*="st-key-po_"]{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:12px;padding:1rem 1.2rem;margin-bottom:.8rem;}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;}}
 @media (max-width:900px){.how{grid-template-columns:1fr;}.hero h1{font-size:2.4rem;}.prow{grid-template-columns:1fr 1fr;}}
@@ -201,9 +209,105 @@ def landing():
     </div>""", unsafe_allow_html=True)
 
 
+# ----------------------------------------------------------------- NEWS PAGE
+@st.cache_data(ttl=900, show_spinner=False)
+def load_news(region, days, themes, keywords, publishers):
+    return news.collect(region, days, list(themes), list(keywords), publishers)
+
+
+def ago(ts):
+    secs = (pd.Timestamp.now("UTC").tz_localize(None) - pd.Timestamp(ts)).total_seconds()
+    return f"{max(int(secs // 60), 1)}m ago" if secs < 3600 else (f"{int(secs // 3600)}h ago" if secs < 86400
+                                                                  else f"{int(secs // 86400)}d ago")
+
+
+def seg(label, options, key):
+    k = f"{key}_{abs(hash(tuple(options))) % 10**6}"
+    return st.segmented_control(label, options, default=options[0], key=k, label_visibility="collapsed") or options[0]
+
+
+def news_page():
+    with st.sidebar:
+        st.markdown('<div class="side-h">News settings</div>', unsafe_allow_html=True)
+        region = st.selectbox("Region", list(news.REGIONS))
+        days = st.select_slider("Look back", options=[1, 3, 7, 14, 30], value=7,
+                                format_func=lambda d: f"{d} day" + ("s" if d > 1 else ""))
+        topics = st.multiselect("Topics", list(news.THEMES), default=list(news.THEMES))
+        kw = st.text_input("Your own keywords", placeholder="rice exports, steel prices, Chennai port",
+                           help="Separate with commas. Up to 5. Each one is searched on its own.")
+        publishers = st.toggle("Also scan business news feeds", value=True)
+        if st.button("Refresh now", width="stretch"):
+            load_news.clear()
+    keywords = tuple(k.strip() for k in kw.split(",") if k.strip())[:5]
+
+    st.markdown('<div class="hero-sm"><h1>Market news</h1><p>Headlines from open sources that can move '
+                'demand, imports and exports.</p></div>', unsafe_allow_html=True)
+    if not topics and not keywords:
+        st.info("Pick at least one topic or add a keyword in the sidebar.")
+        return
+    with st.spinner("Reading the news"):
+        nd, errors = load_news(region, days, tuple(topics), keywords, publishers)
+    if errors:
+        st.caption("Could not reach: " + ", ".join(errors))
+    if nd.empty:
+        st.info("No headlines found. Try a longer look-back, more topics, or check your internet connection.")
+        return
+
+    top_topic = nd["topic"].value_counts().idxmax()
+    kstrip([("Headlines", f"{len(nd):,}", f"last {days} day" + ("s" if days > 1 else "")),
+            ("Risk signals", f"{(nd['signal'] == 'Risk').sum():,}", "delays, bans, shortages, falls"),
+            ("Supportive signals", f"{(nd['signal'] == 'Supportive').sum():,}", "growth, easing, deals"),
+            ("Most covered topic", top_topic, f"{(nd['topic'] == top_topic).sum()} headlines")])
+
+    daily = nd.assign(day=nd["published"].dt.floor("D")).groupby(["day", "signal"]).size().unstack(fill_value=0)
+    fig = go.Figure()
+    for sig, colour in [("Risk", "#FB7185"), ("Mixed", "#FBBF24"), ("Neutral", "rgba(247,245,255,.35)"),
+                        ("Supportive", "#34D399")]:
+        if sig in daily:
+            fig.add_bar(x=daily.index, y=daily[sig], name=sig, marker_color=colour)
+    fig.update_layout(barmode="stack")
+    show(fig, 260)
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        topic_pick = seg("Topic", ["All"] + sorted(nd["topic"].unique()), "ntopic")
+    with c2:
+        sig_pick = seg("Signal", ["All", "Risk", "Supportive", "Mixed", "Neutral"], "nsig")
+    q = st.text_input("Search these headlines", placeholder="Type a word, for example rice or port")
+    view = nd
+    if topic_pick != "All":
+        view = view[view["topic"] == topic_pick]
+    if sig_pick != "All":
+        view = view[view["signal"] == sig_pick]
+    if q:
+        view = view[view["title"].str.contains(q, case=False, regex=False)]
+
+    cls = {"Risk": "hi", "Mixed": "md", "Supportive": "lo", "Neutral": "nu"}
+    rows = ""
+    for _, r in view.head(60).iterrows():
+        link = r["link"] if str(r["link"]).startswith("http") else "#"
+        rows += (f'<div class="nrow {cls[r["signal"]] if r["signal"] != "Neutral" else ""}">'
+                 f'<a href="{html.escape(link)}" target="_blank" rel="noopener noreferrer">{html.escape(r["title"])}</a>'
+                 f'<div class="nm"><span class="chip {cls[r["signal"]]}">{r["signal"]}</span>'
+                 f'<span class="tag">{html.escape(r["topic"])}</span>'
+                 f'<span>{html.escape(r["source"])}</span><span>{ago(r["published"])}</span></div></div>')
+    st.markdown(rows or "<p>No headlines match these filters.</p>", unsafe_allow_html=True)
+    if len(view) > 60:
+        st.caption(f"Showing the newest 60 of {len(view)}. Use the filters to narrow down.")
+    st.download_button("Download headlines", view.to_csv(index=False), "market_news.csv", "text/csv")
+    st.caption("Sources: Google News search feeds and public business RSS feeds. Signals come from simple keyword "
+               "rules on the headline, so treat them as a quick guide and open the article before acting on it.")
+
+
 # --------------------------------------------------------- 2. SIDEBAR (data)
 with st.sidebar:
     st.markdown('<div class="brand"><i></i>Demand Forecaster</div>', unsafe_allow_html=True)
+    page = st.segmented_control("View", ["Forecasting", "Market news"], default="Forecasting", key="page",
+                                label_visibility="collapsed") or "Forecasting"
+if page == "Market news":
+    news_page()
+    st.stop()
+with st.sidebar:
     st.markdown('<div class="side-h">Your data</div>', unsafe_allow_html=True)
     up = st.file_uploader("Sales history", type=["csv", "xlsx", "xls"], label_visibility="collapsed")
     st.toggle("Use demo data", key="demo")

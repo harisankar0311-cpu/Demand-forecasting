@@ -9,3 +9,4 @@ xgboost
 holidays
 # optional, only for the 'polish with Claude' button:
 # anthropic
+requests
