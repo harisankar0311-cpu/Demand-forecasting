@@ -51,6 +51,12 @@ def wape(y, yhat):
     return float(np.abs(y - yhat).sum() / denom) if denom else float("nan")
 
 
+def bias(y, yhat):
+    """Signed error as a share of actual demand. Positive = forecasts too high, negative = too low."""
+    y, yhat = np.asarray(y, float), np.asarray(yhat, float)
+    return float((yhat - y).sum() / y.sum()) if y.sum() else float("nan")
+
+
 def load_table(file_or_path):
     name = getattr(file_or_path, "name", str(file_or_path)).lower()
     if name.endswith((".xlsx", ".xls")):
@@ -245,13 +251,13 @@ def train_driver_model(df, date_col, target_col, holiday_country=None):
         m.fit(X[tr], np.log(y[tr]) if use_log else y[tr])
         pred = _inverse(m.predict(X[va]), use_log)
         rows.append({"Model": name, "MAE": mean_absolute_error(y[va], pred),
-                     "WAPE": wape(y[va], pred), "R2": r2_score(y[va], pred)})
+                     "WAPE": wape(y[va], pred), "R2": r2_score(y[va], pred), "Bias %": bias(y[va], pred)})
         fitted[name] = (m, use_log, kind, pred)
 
     # Baseline for context: the training average
     base = np.full(va.sum(), y[tr].mean())
     rows.append({"Model": "Baseline (training average)", "MAE": mean_absolute_error(y[va], base),
-                 "WAPE": wape(y[va], base), "R2": r2_score(y[va], base)})
+                 "WAPE": wape(y[va], base), "R2": r2_score(y[va], base), "Bias %": bias(y[va], base)})
     board = pd.DataFrame(rows).sort_values("WAPE").reset_index(drop=True)
     best = board[board["Model"] != "Baseline (training average)"].iloc[0]["Model"]
     m_tr, use_log, kind, val_pred = fitted[best]
@@ -431,7 +437,8 @@ def forecast_timeseries(df, date_col, target_col, horizon=30, group_col=None, ag
                     if len(tr_vals) >= season else np.full(hold, tr_vals[-1]))
             resid_sd = float(np.std(te_vals - pred)) or resid_sd
             m_row.update({"Model WAPE": wape(te_vals, pred), "Baseline WAPE": wape(te_vals, base),
-                          "MAE": float(np.abs(te_vals - pred).mean())})
+                          "MAE": float(np.abs(te_vals - pred).mean()), "Bias %": bias(te_vals, pred),
+                          "Baseline bias %": bias(te_vals, base)})
             m_row["Beats baseline"] = bool(m_row["Model WAPE"] < m_row["Baseline WAPE"])
         m_row["Error SD"] = resid_sd
         met_rows.append(m_row)

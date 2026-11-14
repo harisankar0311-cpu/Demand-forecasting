@@ -2,7 +2,10 @@
 Demand Forecaster  -  run with:  python -m streamlit run app.py
 Upload sales history -> forecast -> inventory plan -> monitoring.
 """
+import copy
 import html
+import io
+import json
 import os
 
 import numpy as np
@@ -10,9 +13,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import assistant as asst
 import forecaster as fc
+import intake
 import inventory as inv
 import news
+import quality
 
 # ---------------------------------------------------------------- THEME FILE
 THEME_TOML = """[theme]
@@ -123,6 +129,12 @@ section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0D0919,#000)
 .chip{padding:.15rem .7rem;border-radius:999px;font-size:.8rem;font-weight:700;}
 .chip.hi{background:rgba(251,113,133,.16);color:#FDA4AF;}.chip.md{background:rgba(251,191,36,.16);color:#FCD34D;}.chip.lo{background:rgba(52,211,153,.16);color:#6EE7B7;}
 .chip.nu{background:rgba(255,255,255,.08);color:var(--muted);}
+.hrow{display:grid;grid-template-columns:210px 1fr auto;gap:1rem;align-items:center;padding:.65rem 1rem;margin-bottom:.35rem;
+  background:rgba(255,255,255,.04);border-radius:8px;border-left:4px solid var(--muted);}
+.hrow.ok{border-left-color:#34D399;}.hrow.warn{border-left-color:#FBBF24;}.hrow.note{border-left-color:#A89FC9;}
+.hrow .hn{font-family:'Sora',sans-serif;font-weight:600;color:#fff;font-size:.92rem;}.hrow .hd{color:var(--muted);font-size:.88rem;line-height:1.4;}
+.srow{padding:.15rem 0 .45rem;border-bottom:1px solid var(--line);margin-bottom:.4rem;}
+.srow small{color:var(--muted);}
 .nrow{padding:.75rem 1rem;margin-bottom:.4rem;background:rgba(255,255,255,.04);border-radius:8px;border-left:4px solid var(--muted);}
 .nrow.hi{border-left-color:#FB7185;}.nrow.md{border-left-color:#FBBF24;}.nrow.lo{border-left-color:#34D399;}
 .nrow a{color:#fff;font-weight:600;text-decoration:none;line-height:1.4;}
@@ -131,7 +143,7 @@ section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0D0919,#000)
 .tag{border:1px solid var(--line);color:var(--lilac);padding:.05rem .6rem;border-radius:999px;font-size:.76rem;}
 [class*="st-key-po_"]{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:12px;padding:1rem 1.2rem;margin-bottom:.8rem;}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;}}
-@media (max-width:900px){.how{grid-template-columns:1fr;}.hero h1{font-size:2.4rem;}.prow{grid-template-columns:1fr 1fr;}}
+@media (max-width:900px){.how{grid-template-columns:1fr;}.hero h1{font-size:2.4rem;}.prow,.hrow{grid-template-columns:1fr 1fr;}}
 """
 st.markdown("<style>" + CSS + "</style>", unsafe_allow_html=True)
 
@@ -197,10 +209,12 @@ def landing():
       <p>Upload your sales history. Get a demand forecast, the stock you should hold, and purchase orders
       ready for your approval.</p>
     </div>""", unsafe_allow_html=True)
-    c = st.columns([1.1, 3])
+    c = st.columns([1.1, 1.1, 2.6])
     c[0].button("Try with demo data", type="primary", width="stretch",
                 on_click=lambda: st.session_state.update(demo=True))
-    c[1].caption("Or upload your own CSV or Excel file in the sidebar. You need a date column and a number to forecast.")
+    c[1].button("Try a messy file", width="stretch", on_click=lambda: st.session_state.update(messy=True, page="Prepare data"))
+    c[2].caption("Or upload your own CSV or Excel file in the sidebar. It can be messy: odd date formats, currency "
+                 "symbols, repeated headers. The assistant helps you clean it.")
     st.markdown("""
     <div class="how">
       <div><b>Forecast demand</b><span>Learns from past sales, price, promotions and holidays, then projects the weeks ahead.</span></div>
@@ -299,29 +313,316 @@ def news_page():
                "rules on the headline, so treat them as a quick guide and open the article before acting on it.")
 
 
+# ------------------------------------------------------------- DATA HELPERS
+def get_raw(up):
+    """Read the current data source. Returns (table, notes, signature) or (None, None, None)."""
+    ss = st.session_state
+    try:
+        if up is not None:
+            sheet = ss.get(f"sheet_{up.name}")
+            key = ("file", up.name, up.size, sheet)
+            if ss.get("raw_key") != key:
+                ss["raw"] = intake.load_smart(up, sheet)
+                ss["raw_key"] = key
+            raw, notes = ss["raw"]
+            if len(notes.get("sheets", [])) > 1:
+                with st.sidebar:
+                    st.selectbox("Sheet", notes["sheets"], index=notes["sheets"].index(notes["sheet"]), key=f"sheet_{up.name}")
+            return raw, notes, f"{up.name}|{up.size}|{notes.get('sheet')}"
+        if ss.get("messy"):
+            if ss.get("raw_key") != ("messy",):
+                data, _ = intake.messy_demo()
+                buf = io.BytesIO(data)
+                buf.name = "messy_sales_sample.csv"
+                ss["raw"], ss["raw_key"] = intake.load_smart(buf), ("messy",)
+            return ss["raw"][0], ss["raw"][1], "messy"
+        if ss.get("demo"):
+            return fc.demo_data(), {"name": "demo data", "kind": "demo", "messages": [], "sheets": []}, "demo"
+    except Exception as e:
+        st.error(f"Could not read this file: {e}")
+    return None, None, None
+
+
+def triage(raw, sig):
+    ss = st.session_state
+    if ss.get("triage_sig") != sig:
+        ss["triage"], ss["triage_sig"] = intake.analyze(raw), sig
+    return ss["triage"]
+
+
+def health_panel(frame, dcol, tcol, gcol=None):
+    try:
+        items = quality.data_health(frame, dcol, tcol, gcol)
+    except Exception as e:
+        st.warning(f"Could not run the health check: {e}")
+        return
+    n_ok = sum(i["status"] == "ok" for i in items)
+    kstrip([("Checks passed", f"{n_ok} of {len(items)}", ""), ("Need a look", str(sum(i["status"] == "warn" for i in items)), "warnings"),
+            ("Good to know", str(sum(i["status"] == "note" for i in items)), "notes")])
+    chip, cls = {"ok": "Fine", "note": "Note", "warn": "Check"}, {"ok": "lo", "note": "nu", "warn": "md"}
+    st.markdown("".join(
+        f'<div class="hrow {i["status"]}"><span class="hn">{html.escape(i["check"])}</span>'
+        f'<span class="hd">{html.escape(i["detail"])}</span><span class="chip {cls[i["status"]]}">{chip[i["status"]]}</span></div>'
+        for i in items), unsafe_allow_html=True)
+
+
+def prepare_empty():
+    st.markdown('<div class="hero-sm"><h1>Prepare data</h1><p>Upload a file in the sidebar, or try the sample.</p></div>',
+                unsafe_allow_html=True)
+    c = st.columns([1.2, 1.2, 2.6])
+    c[0].button("Load a messy sample", type="primary", width="stretch", on_click=lambda: st.session_state.update(messy=True))
+    c[1].button("Use demo data", width="stretch", on_click=lambda: st.session_state.update(demo=True))
+    st.caption("The messy sample has odd date formats, rupee symbols, lakh amounts, mixed promo labels, repeated headers "
+               "and a total row, so you can see the cleaner and the assistant at work.")
+
+
+# ------------------------------------------------------------ PREPARE PAGE
+def _clean_recipe(recipe):
+    keep = ("id", "op", "enabled", "column", "dayfirst", "decimal", "factor", "custom", "operator", "value", "reason",
+            "method", "cap", "new_name", "mapping", "id_cols")
+    return [{k: v for k, v in s.items() if k in keep} for s in recipe]
+
+
+def _use_data(sig, clean, aside, log, key):
+    st.session_state["prepared"] = {"sig": sig, "df": clean, "aside": aside, "log": log, "key": key}
+    st.session_state["page"] = "Forecasting"
+
+
+def _answer(qid, idx):
+    S = st.session_state["intake"]
+    q = next(q for q in S["questions"] if q["id"] == qid)
+    S["recipe"], msg = intake.answer_question(S["recipe"], q, idx)
+    S["answered"].append(qid)
+    S["chat"].append({"role": "assistant", "content": msg})
+
+
+def prepare_page(raw, notes, sig):
+    ss = st.session_state
+    S = ss.get("intake")
+    if not S or S["sig"] != sig:
+        an = copy.deepcopy(triage(raw, sig))
+        if an["clean"]:
+            hello = ("Your file looks clean, so nothing needs fixing. You can go straight to Forecasting. "
+                     "If something looks wrong to you, tell me and I will adjust it.")
+        else:
+            hello = (f"I read {len(raw):,} rows and {len(raw.columns)} columns. I added {an['fixes']} cleaning step(s) "
+                     f"on my own and have {len([q for q in an['questions'] if not q['optional']])} question(s) for you. "
+                     "You can also just tell me about your data, for example *dates are day first* or *ignore Cancelled orders*. "
+                     "Nothing is deleted: rows I cannot use are set aside and listed.")
+        S = ss["intake"] = {"sig": sig, "recipe": an["steps"], "questions": an["questions"], "answered": [],
+                            "chat": [{"role": "assistant", "content": hello}], "roles": {}, "applied_key": None}
+
+    # run the recipe on a copy of the raw table
+    key = json.dumps(S["recipe"], sort_keys=True, default=str)
+    if S["applied_key"] != key:
+        S["applied"], S["applied_key"] = intake.apply_recipe(raw, S["recipe"]), key
+    clean, aside, log = S["applied"]
+
+    st.markdown('<div class="hero-sm"><h1>Prepare data</h1><p>Fix messy files without losing rows. Explain your data to the '
+                'assistant and it follows your instructions.</p></div>', unsafe_allow_html=True)
+    read_bits = [f"{notes.get('kind', 'file')}"]
+    if notes.get("delimiter"):
+        read_bits.append("separator '" + ("tab" if notes["delimiter"] == "\t" else notes["delimiter"]) + "'")
+    if notes.get("encoding"):
+        read_bits.append(notes["encoding"])
+    if notes.get("sheet"):
+        read_bits.append(f"sheet '{notes['sheet']}'")
+    st.caption("Read as " + ", ".join(read_bits) + ". " + " ".join(notes.get("messages", [])))
+    kstrip([("Rows read", f"{len(raw):,}", f"{len(raw.columns)} columns"), ("Rows after cleaning", f"{len(clean):,}", f"{len(S['recipe'])} steps"),
+            ("Set aside", f"{len(aside):,}", "listed under Needs attention")])
+
+    left, right = st.columns([5, 6], gap="large")
+    pending = [q for q in S["questions"] if q["id"] not in S["answered"] and not q["optional"]]
+    optional = [q for q in S["questions"] if q["id"] not in S["answered"] and q["optional"]]
+
+    # ---------------- chat
+    with left:
+        section("Assistant", "Ask, explain or correct. I will ask when I am unsure.")
+        with st.expander("Understand any wording with a language model (optional)"):
+            api_key = st.text_input("Anthropic API key", type="password", key="prep_key")
+            model = st.text_input("Model", value="claude-sonnet-5-5", key="prep_model")
+            st.caption("Without a key, I follow the common phrasings listed when you type *help*. With a key, a language model "
+                       "turns your own words into the same safe cleaning steps. Only column names and a few sample values are sent.")
+            if st.checkbox("Show what would be sent", key="prep_show"):
+                st.code(asst.build_prompt("<your message>", clean, S["recipe"])[:2500], language=None)
+        llm = (api_key, model) if api_key else None
+        box = st.container(height=440)
+        with box:
+            for m in S["chat"]:
+                with st.chat_message(m["role"]):
+                    st.markdown(m["content"])
+            for q in pending + optional[:2]:
+                with st.chat_message("assistant"):
+                    st.markdown(("**Suggestion:** " if q["optional"] else "**Question:** ") + q["text"])
+                    bc = st.columns(len(q["options"]))
+                    for i, o in enumerate(q["options"]):
+                        bc[i].button(o["label"], key=f"ans_{q['id']}_{i}", on_click=_answer, args=(q["id"], i), width="stretch")
+        text = st.chat_input("Tell me about your data, or type help")
+        if text:
+            S["chat"].append({"role": "user", "content": text})
+            r = asst.respond(text, clean, S["recipe"], llm)
+            for stp in r["steps"]:
+                S["recipe"], _ = intake.upsert_step(S["recipe"], stp)
+            if r["undo"] == "last" and S["recipe"]:
+                S["recipe"].pop()
+            elif isinstance(r["undo"], int) and 0 < r["undo"] <= len(S["recipe"]):
+                S["recipe"].pop(r["undo"] - 1)
+            S["roles"].update(r["roles"])
+            if r["question"]:
+                S["questions"].append(r["question"])
+            S["chat"].append({"role": "assistant", "content": r["reply"] or "I did not catch that. Type *help* to see what I can do."})
+            st.rerun()
+
+    # ---------------- recipe, preview, set aside, health
+    with right:
+        t_rec, t_prev, t_aside, t_health = st.tabs(["Cleaning recipe", "Preview", "Needs attention", "Data health"])
+        with t_rec:
+            if not S["recipe"]:
+                st.caption("No steps. The file is used as it is.")
+            by_id = {e["step_id"]: e for e in log}
+            for i, stp in enumerate(S["recipe"]):
+                c1, c2, c3 = st.columns([0.6, 7, 1.4])
+                stp["enabled"] = c1.checkbox("on", value=stp.get("enabled", True), key=f"en_{stp['id']}", label_visibility="collapsed")
+                e = by_id.get(stp["id"])
+                line = f"**{i + 1}. {intake.step_title(stp)}**"
+                if stp.get("auto"):
+                    line += "  <small>(added automatically)</small>"
+                c2.markdown(line, unsafe_allow_html=True)
+                if e:
+                    detail = ([f"{e['changed']:,} value(s) changed"] if e["changed"] else []) + e["notes"][:3]
+                    if detail:
+                        c2.caption(" ".join(detail))
+                    if e["examples"]:
+                        c2.caption("Example: " + "; ".join(f"{a} → {b}" for a, b in e["examples"][:3]))
+                if c3.button("Remove", key=f"rm_{stp['id']}"):
+                    S["recipe"].remove(stp)
+                    st.rerun()
+            with st.expander("Add a step yourself"):
+                labels = {"Read dates": "parse_dates", "Read numbers or money": "parse_number", "Multiply by a factor": "scale",
+                          "Merge spellings": "standardise_text", "Set rows aside": "set_aside", "Fill missing values": "fill_missing",
+                          "Treat zeros as missing": "zero_as_missing", "Flag or cap outliers": "flag_outliers",
+                          "Rename a column": "rename", "Leave out a column": "ignore_column"}
+                kind = labels[st.selectbox("What do you want to do?", list(labels), key="man_op")]
+                col = st.selectbox("Column", list(clean.columns) + [c for c in raw.columns if c not in clean.columns], key="man_col")
+                step = {"op": kind, "column": col}
+                if kind == "parse_dates":
+                    step["dayfirst"] = {"Detect automatically": None, "Day first": True, "Month first": False}[
+                        st.selectbox("Date order", ["Detect automatically", "Day first", "Month first"], key="man_df")]
+                elif kind == "parse_number":
+                    step["decimal"] = st.selectbox("Decimal mark", ["auto", "dot", "comma"], key="man_dec")
+                elif kind == "scale":
+                    step["factor"] = st.number_input("Multiply by", value=1.0, key="man_fac")
+                elif kind == "set_aside":
+                    step["operator"] = st.selectbox("When the value", ["equals", "not_equals", "contains", "greater_than", "less_than", "is_empty"], key="man_opr")
+                    step["value"] = st.text_input("This value", key="man_val")
+                elif kind == "fill_missing":
+                    step["method"] = st.selectbox("Fill with", ["zero", "median", "mean", "ffill", "interpolate"], key="man_met")
+                elif kind == "flag_outliers":
+                    step["cap"] = st.checkbox("Also cap them", key="man_cap")
+                elif kind == "rename":
+                    step["new_name"] = st.text_input("New name", key="man_new")
+                if st.button("Add this step", key="man_add"):
+                    good, msg = intake.validate_step(step, list(clean.columns) + list(raw.columns))
+                    if good:
+                        S["recipe"], _ = intake.upsert_step(S["recipe"], good)
+                        S["chat"].append({"role": "assistant", "content": f"Added: {intake.step_title(good)}."})
+                        st.rerun()
+                    else:
+                        st.warning(f"Could not add that step: {msg}.")
+            c1, c2 = st.columns(2)
+            c1.download_button("Save this recipe", json.dumps(_clean_recipe(S["recipe"]), indent=1, default=str),
+                               "cleaning_recipe.json", "application/json", width="stretch")
+            saved = c2.file_uploader("Load a saved recipe", type=["json"], key="recipe_up", label_visibility="collapsed")
+            if saved:
+                try:
+                    steps_in = json.load(saved)
+                    good = [g for g in (intake.validate_step(x, list(raw.columns))[0] for x in steps_in) if g]
+                    if good and json.dumps(good, sort_keys=True) != ss.get("recipe_loaded"):
+                        ss["recipe_loaded"] = json.dumps(good, sort_keys=True)
+                        S["recipe"] = [{**intake.new_step(g["op"]), **g, "auto": False} for g in good]
+                        S["chat"].append({"role": "assistant", "content": f"Loaded a saved recipe with {len(good)} step(s)."})
+                        st.rerun()
+                except Exception as e:
+                    st.warning(f"Could not read that recipe: {e}")
+
+        with t_prev:
+            section("Cleaned table", "This is what the forecast will use.")
+            st.dataframe(clean.head(60), width="stretch")
+            common = [c for c in raw.columns if c in clean.columns]
+            if common:
+                pick = st.selectbox("Compare one column before and after", common, key="cmp_col")
+                head = raw[pick].head(12)
+                st.dataframe(pd.DataFrame({"Before": head.astype(str), "After": clean[pick].reindex(head.index).astype(str)}),
+                             width="stretch")
+
+        with t_aside:
+            if len(aside):
+                section("Rows set aside", "Not deleted. They are left out of the forecast because they cannot be used as they are.")
+                st.dataframe(aside.groupby("reason").size().rename("Rows").reset_index().rename(columns={"reason": "Reason"}),
+                             width="stretch", hide_index=True)
+                st.dataframe(aside.astype(str), width="stretch")
+                st.download_button("Download these rows", aside.to_csv(), "rows_needing_attention.csv", "text/csv")
+            else:
+                st.caption("Nothing has been set aside. Every row is used.")
+
+        with t_health:
+            cc = list(clean.columns)
+            d_guess = S["roles"].get("date") or fc.guess_date_col(clean)
+            numc = [c for c in cc if pd.api.types.is_numeric_dtype(clean[c])]
+            t_guess = S["roles"].get("target") or fc.guess_target_col(clean, d_guess)
+            a, b = st.columns(2)
+            dcol = a.selectbox("Date column", cc, index=cc.index(d_guess) if d_guess in cc else 0, key="h_date")
+            tcol = b.selectbox("Target column", numc or cc, index=(numc or cc).index(t_guess) if t_guess in (numc or cc) else 0, key="h_tgt")
+            health_panel(clean, dcol, tcol)
+
+    st.divider()
+    a, b = st.columns([2, 3])
+    a.button("Use this data and go to Forecasting", type="primary", width="stretch",
+             on_click=_use_data, args=(sig, clean, aside, log, key))
+    prep = ss.get("prepared")
+    if prep and prep["sig"] == sig:
+        b.caption("This data is in use for forecasting." if prep["key"] == key else
+                  "You changed the recipe after applying it. Select the button again to update the forecast data.")
+    else:
+        b.caption("Skip this page if your file already looks clean. The forecast then uses it as it is.")
+
+
 # --------------------------------------------------------- 2. SIDEBAR (data)
+st.session_state.setdefault("page", "Forecasting")
 with st.sidebar:
     st.markdown('<div class="brand"><i></i>Demand Forecaster</div>', unsafe_allow_html=True)
-    page = st.segmented_control("View", ["Forecasting", "Market news"], default="Forecasting", key="page",
+    page = st.segmented_control("View", ["Prepare data", "Forecasting", "Market news"], key="page",
                                 label_visibility="collapsed") or "Forecasting"
 if page == "Market news":
     news_page()
     st.stop()
 with st.sidebar:
     st.markdown('<div class="side-h">Your data</div>', unsafe_allow_html=True)
-    up = st.file_uploader("Sales history", type=["csv", "xlsx", "xls"], label_visibility="collapsed")
+    up = st.file_uploader("Sales history", type=["csv", "xlsx", "xlsm", "xls"], label_visibility="collapsed")
     st.toggle("Use demo data", key="demo")
+    st.toggle("Use messy sample file", key="messy")
 
-df = fc.load_table(up) if up else (fc.demo_data() if st.session_state.get("demo") else None)
-if df is None:
-    landing()
+raw, load_notes, sig = get_raw(up)
+if raw is None:
+    prepare_empty() if page == "Prepare data" else landing()
     st.stop()
+if page == "Prepare data":
+    prepare_page(raw, load_notes, sig)
+    st.stop()
+
+# Lane 1 (clean data) uses the file as it is. Lane 2 uses the cleaned table from Prepare data.
+prep = st.session_state.get("prepared")
+using_prepared = bool(prep and prep["sig"] == sig)
+df = prep["df"] if using_prepared else raw
+triage_result = triage(raw, sig)
 
 # --------------------------------------------------------- 3. SIDEBAR (setup)
 cols = list(df.columns)
 numeric = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
-g_date, = [fc.guess_date_col(df)]
-g_target = fc.guess_target_col(df, g_date)
+_S = st.session_state.get("intake") or {}
+roles = _S.get("roles", {}) if _S.get("sig") == sig else {}
+g_date = roles["date"] if roles.get("date") in cols else fc.guess_date_col(df)
+g_target = roles["target"] if roles.get("target") in numeric else fc.guess_target_col(df, g_date)
 with st.sidebar:
     st.markdown('<div class="side-h">Setup</div>', unsafe_allow_html=True)
     date_col = st.selectbox("Date column", cols, index=cols.index(g_date))
@@ -371,10 +672,16 @@ with st.sidebar:
 # ----------------------------------------------------------------- 4. HEADER
 dts = pd.to_datetime(df[date_col], errors="coerce")
 span = f"{dts.min():%d %b %Y} to {dts.max():%d %b %Y}" if dts.notna().any() else "dates not recognised"
+data_state = ("Cleaned data in use" if using_prepared else "Data looks clean" if triage_result["clean"] else "Needs cleaning")
 st.markdown(f"""<div class="hero-sm"><h1>Demand Forecaster</h1>
 <p>Forecast, plan stock, and check accuracy.</p></div>
 <div class="facts"><span class="fact">{len(df):,} rows</span><span class="fact">{len(df.columns)} columns</span>
-<span class="fact">{html.escape(span)}</span></div>""", unsafe_allow_html=True)
+<span class="fact">{html.escape(span)}</span><span class="fact">{data_state}</span></div>""", unsafe_allow_html=True)
+if not using_prepared and not triage_result["clean"]:
+    _nq = len([q for q in triage_result["questions"] if not q["optional"]])
+    st.warning(f"This file needs cleaning before it can be forecast reliably: {triage_result['fixes']} fix(es) and {_nq} "
+               "question(s) found. Forecasting it as it is may misread or skip rows.")
+    st.button("Open Prepare data", on_click=lambda: st.session_state.update(page="Prepare data"))
 if THEME_JUST_INSTALLED:
     st.info("Theme file created. Stop the app (Ctrl+C in the terminal) and start it again to apply the full "
             "purple and black theme to tables and widgets.")
@@ -415,7 +722,7 @@ def render_future():
     for note in res["notes"][:3]:
         st.warning(note)
 
-    t_fc, t_acc, t_inv, t_mon, t_data = st.tabs(["Forecast", "Accuracy", "Inventory", "Monitor", "Data"])
+    t_fc, t_acc, t_inv, t_mon, t_health, t_data = st.tabs(["Forecast", "Accuracy", "Inventory", "Monitor", "Data health", "Data"])
 
     # ---- Forecast
     with t_fc:
@@ -430,7 +737,9 @@ def render_future():
                  f"{total_f / prev - 1:+.1%} vs the previous {H}" if prev > 0 else ""),
                 ("Typical error in testing", f"{err:.1%}" if pd.notna(err) else "n/a", "lower is better"),
                 ("Beats a simple baseline", "n/a" if pd.isna(beats) else ("Yes" if beats else "No"),
-                 "repeat last season")])
+                 "repeat last season"),
+                ("Bias in testing", f"{mrow.get('Bias %', np.nan):+.1%}" if pd.notna(mrow.get("Bias %", np.nan)) else "n/a",
+                 quality.bias_status(mrow.get("Bias %", np.nan))[1].split(", ", 1)[-1])])
         show_band = st.toggle("Show likely range", value=True)
         with st.container(key="stage"):
             fig = go.Figure()
@@ -468,7 +777,26 @@ def render_future():
             fig.add_bar(x=done["Group"], y=done["Baseline WAPE"], name="Baseline", marker_color="#F7F5FF")
             fig.update_layout(barmode="group", yaxis_tickformat=".0%")
             show(fig, 320)
-        st.dataframe(met.round(3), width="stretch", hide_index=True)
+        seg = quality.segment_products(hdf, met)
+        section("Which products can you trust?",
+                "Class: A = products making up the first 80% of volume, B = the next 15%, C = the rest. X = steady demand, "
+                "Y = moderate swings, Z = erratic. Reliable means it beats the baseline, bias is within 10% and the typical "
+                "error is under 30%.")
+        tint = {"Reliable": "rgba(52,211,153,.22)", "Check": "rgba(251,191,36,.22)", "Weak": "rgba(251,113,133,.28)"}
+        sty = seg.style.format({"Share of volume": "{:.0%}", "Variability (CV)": "{:.2f}", "Model WAPE": "{:.1%}",
+                                "Baseline WAPE": "{:.1%}", "Bias %": "{:+.1%}"}, na_rep="n/a")
+        sty = getattr(sty, "map", None) and sty.map(lambda v: f"background-color: {tint.get(v, 'transparent')}", subset=["Trust"]) or \
+            sty.applymap(lambda v: f"background-color: {tint.get(v, 'transparent')}", subset=["Trust"])
+        st.dataframe(sty, width="stretch", hide_index=True)
+        bias_df = seg.dropna(subset=["Bias %"])
+        if len(bias_df):
+            fig = go.Figure(go.Bar(x=bias_df["Group"], y=bias_df["Bias %"],
+                                   marker_color=["#FB7185" if v > 0.10 else "#FBBF24" if abs(v) > 0.05 else "#34D399" if v >= -0.05
+                                                 else "#FBBF24" if v >= -0.10 else "#FB7185" for v in bias_df["Bias %"]]))
+            fig.update_layout(yaxis_tickformat=".0%", title="Bias in testing (above zero = forecasts too high)")
+            show(fig, 260)
+        with st.expander("Full test results"):
+            st.dataframe(met.round(3), width="stretch", hide_index=True)
 
     # ---- Inventory
     with t_inv:
@@ -582,6 +910,10 @@ def render_future():
             except Exception as e:
                 st.error(str(e))
 
+    with t_health:
+        section("Data health", "Checks on the data behind this forecast.")
+        health_panel(df, p["date_col"], p["target_col"], p["group_col"])
+
     with t_data:
         st.dataframe(df.head(500), width="stretch", hide_index=True)
 
@@ -611,8 +943,9 @@ def render_drivers():
     best = board[board["Model"] == bundle["best"]].iloc[0]
     kstrip([("Best model", bundle["best"], ""), ("Typical error", f"{best['WAPE']:.1%}", "on the latest rows"),
             ("R squared", f"{best['R2']:.3f}", "1.0 is a perfect fit"),
+            ("Bias", f"{best['Bias %']:+.1%}", quality.bias_status(best["Bias %"])[1].split(", ", 1)[-1]),
             ("Trained on", f"{bundle['train_rows']:,} rows", f"tested on {bundle['valid_rows']:,}")])
-    t_mod, t_pred, t_mon, t_data = st.tabs(["Models", "Predict", "Monitor", "Data"])
+    t_mod, t_pred, t_mon, t_health, t_data = st.tabs(["Models", "Predict", "Monitor", "Data health", "Data"])
 
     with t_mod:
         left, right = st.columns(2)
@@ -669,6 +1002,10 @@ def render_drivers():
                     st.rerun()
             except Exception as e:
                 st.error(str(e))
+
+    with t_health:
+        section("Data health", "Checks on the data behind these models.")
+        health_panel(df, date_col, target_col)
 
     with t_data:
         st.dataframe(df.head(500), width="stretch", hide_index=True)
